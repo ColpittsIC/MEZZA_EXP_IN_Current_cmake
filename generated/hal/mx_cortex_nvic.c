@@ -17,6 +17,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "mx_cortex_nvic.h"
+#include "mx_usart1.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -33,5 +34,23 @@ system_status_t mx_cortex_nvic_init(void)
   /* Configure the Priority grouping */
   HAL_CORTEX_NVIC_SetPriorityGrouping(HAL_CORTEX_NVIC_PRIORITY_GROUP_4);
 
+  /* USART1: interrupt line always enabled. Harmless when USART1 is only used
+     in polling mode (HAL_UART_Transmit/Receive do not enable any USART-level
+     interrupt source, so the NVIC line never fires in that case); required
+     when USART1 is used in interrupt mode (HAL_UART_Transmit_IT / _ReceiveToIdle_IT). */
+  HAL_CORTEX_NVIC_SetPriority(USART1_IRQn, HAL_CORTEX_NVIC_PREEMP_PRIORITY_5, HAL_CORTEX_NVIC_SUB_PRIORITY_0);
+  HAL_CORTEX_NVIC_EnableIRQ(USART1_IRQn);
+
   return SYSTEM_OK;
+}
+
+/******************************************************************************/
+/*                         Peripheral Interrupt Handlers                      */
+/******************************************************************************/
+/**
+  * @brief  This function handles USART1 global interrupt.
+  */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(mx_usart1_uart_gethandle());
 }
