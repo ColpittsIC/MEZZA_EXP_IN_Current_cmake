@@ -17,7 +17,6 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "mx_cortex_nvic.h"
-#include "mx_usart1.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -44,13 +43,8 @@ system_status_t mx_cortex_nvic_init(void)
   return SYSTEM_OK;
 }
 
-/******************************************************************************/
-/*                         Peripheral Interrupt Handlers                      */
-/******************************************************************************/
-/**
-  * @brief  This function handles USART1 global interrupt.
-  */
-void USART1_IRQHandler(void)
-{
-  HAL_UART_IRQHandler(mx_usart1_uart_gethandle());
-}
+/* NOTE: USART1_IRQHandler() is implemented in main.c, not here: in
+   APP_MODE_COMMS_TEST/APP_MODE_LOOPBACK_TEST it needs to re-arm
+   HAL_UART_ReceiveToIdle_IT() right after HAL_UART_IRQHandler() returns
+   (once rx_state is back to IDLE), which requires access to the
+   application's RX buffer and re-arm flag. See main.c for details. */

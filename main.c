@@ -26,11 +26,12 @@
  * ===========================================================================*/
 #define APP_MODE_ADC_DEBUG      0  /* USART1 streams the 8-channel 4-20mA ADC report (polling, human-readable) */
 #define APP_MODE_COMMS_TEST     1  /* USART1 is the interrupt-driven PING/PONG link to the remote board */
+#define APP_MODE_LOOPBACK_TEST  2  /* USART1 self-test: requires PA9 (TX) jumpered to PA10 (RX) on this board */
 
 #define APP_MODE                APP_MODE_COMMS_TEST
 
-#if (APP_MODE != APP_MODE_ADC_DEBUG) && (APP_MODE != APP_MODE_COMMS_TEST)
-#error "APP_MODE must be set to APP_MODE_ADC_DEBUG or APP_MODE_COMMS_TEST"
+#if (APP_MODE != APP_MODE_ADC_DEBUG) && (APP_MODE != APP_MODE_COMMS_TEST) && (APP_MODE != APP_MODE_LOOPBACK_TEST)
+#error "APP_MODE must be set to APP_MODE_ADC_DEBUG, APP_MODE_COMMS_TEST or APP_MODE_LOOPBACK_TEST"
 #endif
 
 #define UART_TX_TIMEOUT_MS      100U
@@ -62,7 +63,7 @@ static void uart_print(hal_uart_handle_t *huart, const char *str)
   HAL_UART_Transmit(huart, (const uint8_t *)str, (uint32_t)strlen(str), UART_TX_TIMEOUT_MS);
 }
 
-#else /* APP_MODE_COMMS_TEST */
+#elif (APP_MODE == APP_MODE_COMMS_TEST)
 /* =============================================================================
  * APP_MODE_COMMS_TEST: interrupt-driven PING/PONG link to the remote board
  * (remote: USART3 on PB3/PB4, sends "PING <n>\r\n" once a second).
@@ -70,27 +71,76 @@ static void uart_print(hal_uart_handle_t *huart, const char *str)
  * it, so the link to the remote board stays clean; state below is meant to be
  * inspected via debugger/live-watch instead.
  * ===========================================================================*/
+/* Set to 1 for a raw RX sanity check: PB15 toggles on every single byte
+   received on USART1, bypassing PING/PONG parsing entirely. Confirms the
+   RXNE interrupt/ISR chain fires at all when the remote board sends
+   something, independent of IDLE-line detection and message framing.
+   Set back to 0 for the normal PING/PONG protocol behavior. */
+#define COMMS_RAW_RX_DEBUG      0
+
 #define COMMS_RX_BUF_SIZE       32U
 #define COMMS_TX_BUF_SIZE       32U
 
 static uint8_t comms_rx_buf[COMMS_RX_BUF_SIZE];
+
+static volatile uint32_t comms_error_count       = 0U;
+static volatile uint32_t comms_last_error_codes   = 0U; /* HAL_UART_RECEIVE_ERROR_xxx bitmask, see stm32c5xx_hal_uart.h */
+static volatile uint8_t  comms_rx_rearm_pending   = 0U;
+
+/* PB15 toggles on every message received (raw mode: every single byte;
+   normal mode: every complete "IDLE-terminated" message, regardless of
+   whether it parses as a valid PING) - put a probe/LED on it for a visual,
+   debugger-free check that reception is actually happening on this path. */
+static void comms_pb15_init(void)
+{
+  HAL_RCC_GPIOB_EnableClock();
+
+  hal_gpio_config_t gpio_config;
+  gpio_config.mode        = HAL_GPIO_MODE_OUTPUT;
+  gpio_config.output_type = HAL_GPIO_OUTPUT_PUSHPULL;
+  gpio_config.pull        = HAL_GPIO_PULL_NO;
+  gpio_config.speed       = HAL_GPIO_SPEED_FREQ_LOW;
+  gpio_config.init_state  = HAL_GPIO_PIN_RESET;
+  HAL_GPIO_Init(HAL_GPIOB, HAL_GPIO_PIN_15, &gpio_config);
+}
+
+#if (COMMS_RAW_RX_DEBUG == 1)
+static volatile uint32_t comms_raw_rx_byte_count = 0U;
+#else /* COMMS_RAW_RX_DEBUG == 0 */
 static uint8_t comms_tx_buf[COMMS_TX_BUF_SIZE];
 
 static volatile uint32_t comms_ping_rx_count = 0U;
 static volatile uint32_t comms_pong_tx_count = 0U;
-static volatile uint32_t comms_error_count   = 0U;
 static volatile uint32_t comms_last_ping_n   = 0U;
+
+/* Bumped when something IS received (no line error) but does not match the
+   expected "PING <n>" text: a byte-for-byte copy is kept here so a debugger
+   can inspect exactly what the remote board actually sent, to catch a format
+   mismatch (wrong case, different separator, extra/missing characters, ...)
+   that would otherwise fail silently (comms_ping_rx_count staying at 0 gives
+   no clue whether nothing arrived at all, or something arrived unrecognized). */
+static volatile uint32_t comms_unrecognized_count    = 0U;
+static char              comms_last_unrecognized_msg[COMMS_RX_BUF_SIZE + 1U];
+static volatile uint32_t comms_last_unrecognized_len = 0U;
+#endif /* COMMS_RAW_RX_DEBUG */
 
 static void comms_rx_arm(hal_uart_handle_t *huart)
 {
+#if (COMMS_RAW_RX_DEBUG == 1)
+  (void)HAL_UART_ReceiveToIdle_IT(huart, comms_rx_buf, 1U); /* one byte at a time */
+#else
   (void)HAL_UART_ReceiveToIdle_IT(huart, comms_rx_buf, sizeof(comms_rx_buf));
+#endif /* COMMS_RAW_RX_DEBUG */
 }
 
+#if (COMMS_RAW_RX_DEBUG == 0)
 /* Parses "PING <n>\r\n" and, on the same link, replies "PONG <n>\r\n" */
 static void comms_process_message(hal_uart_handle_t *huart, const uint8_t *data, uint32_t size_byte)
 {
   char msg[COMMS_RX_BUF_SIZE + 1U];
   uint32_t copy_len = (size_byte < COMMS_RX_BUF_SIZE) ? size_byte : COMMS_RX_BUF_SIZE;
+
+  HAL_GPIO_TogglePin(HAL_GPIOB, HAL_GPIO_PIN_15);
 
   memcpy(msg, data, copy_len);
   msg[copy_len] = '\0';
@@ -115,19 +165,144 @@ static void comms_process_message(hal_uart_handle_t *huart, const uint8_t *data,
       comms_error_count++;
     }
   }
+  else
+  {
+    comms_unrecognized_count++;
+    memcpy(comms_last_unrecognized_msg, msg, copy_len + 1U);
+    comms_last_unrecognized_len = copy_len;
+  }
 }
+#endif /* COMMS_RAW_RX_DEBUG == 0 */
 
+/* IMPORTANT: do NOT call comms_rx_arm()/HAL_UART_ReceiveToIdle_IT() from
+   here. HAL_UART_IRQHandler()'s non-DMA "reception to IDLE" completion path
+   calls this callback and only AFTER it returns does it unconditionally reset
+   huart->rx_state to HAL_UART_RX_STATE_IDLE - clobbering the RX_STATE_ACTIVE
+   that a re-arm done in here would have just set. UART_RxISR_8BIT() then
+   silently flushes every subsequent received byte because it gates on
+   rx_state == ACTIVE, so the link goes deaf after exactly one message.
+   Just flag that a re-arm is needed; the actual re-arm happens in
+   USART1_IRQHandler() (see below), right after HAL_UART_IRQHandler() (and
+   therefore this callback) has returned and rx_state is IDLE again - still
+   inside the same interrupt, so there is no gap where reception is unarmed. */
 void HAL_UART_RxCpltCallback(hal_uart_handle_t *huart, uint32_t size_byte, hal_uart_rx_event_types_t rx_event)
 {
   (void)rx_event;
+#if (COMMS_RAW_RX_DEBUG == 1)
+  (void)huart;
+  (void)size_byte;
+  comms_raw_rx_byte_count++;
+  HAL_GPIO_TogglePin(HAL_GPIOB, HAL_GPIO_PIN_15);
+#else
   comms_process_message(huart, comms_rx_buf, size_byte);
-  comms_rx_arm(huart);
+#endif /* COMMS_RAW_RX_DEBUG */
+  comms_rx_rearm_pending = 1U;
+}
+
+/* PB15 also toggles here so a line error (framing/noise/overrun) on the real
+   link to the remote board becomes visible even without a debugger - it just
+   can't be told apart on the scope from a successful reception by itself;
+   comms_last_error_codes (via debugger) is what distinguishes the two for
+   real, and which exact error it is (needs USE_HAL_UART_GET_LAST_ERRORS=1
+   in stm32c5xx_hal_conf.h, see HAL_UART_RECEIVE_ERROR_xxx in
+   stm32c5xx_hal_uart.h: bit0=PE parity, bit1=NE noise, bit2=FE framing,
+   bit3=ORE overrun, bit5=RTO timeout). */
+void HAL_UART_ErrorCallback(hal_uart_handle_t *huart)
+{
+  comms_error_count++;
+  comms_last_error_codes = HAL_UART_GetLastErrorCodes(huart);
+  HAL_GPIO_TogglePin(HAL_GPIOB, HAL_GPIO_PIN_15);
+  comms_rx_rearm_pending = 1U;
+}
+
+/* USART1 global interrupt handler: services the peripheral, then re-arms
+   reception if HAL_UART_RxCpltCallback()/HAL_UART_ErrorCallback() flagged it
+   as needed (see their comments for why this can't be done in-line). */
+void USART1_IRQHandler(void)
+{
+  hal_uart_handle_t *huart = mx_usart1_uart_gethandle();
+
+  HAL_UART_IRQHandler(huart);
+
+  if (comms_rx_rearm_pending != 0U)
+  {
+    comms_rx_rearm_pending = 0U;
+    comms_rx_arm(huart);
+  }
+}
+
+#else /* APP_MODE_LOOPBACK_TEST */
+/* =============================================================================
+ * APP_MODE_LOOPBACK_TEST: local self-test, independent of the remote board.
+ * Requires PA9 (TX) physically jumpered to PA10 (RX) on THIS board. This
+ * firmware generates its own "PING <n>\r\n" once a second on USART1 and
+ * expects to receive it right back through the wire; every time a message is
+ * received, PB15 is toggled - put a probe/LED on it to check the whole
+ * TX + wire + RX + interrupt chain on this board alone, with no dependency
+ * on the link to the remote board.
+ * Set APP_MODE back to APP_MODE_COMMS_TEST once this checks out, and remove
+ * the PA9-PA10 jumper before reconnecting to the remote board.
+ * ===========================================================================*/
+#define LOOPBACK_TX_PERIOD_MS   1000U
+#define LOOPBACK_TX_BUF_SIZE    32U
+#define LOOPBACK_RX_BUF_SIZE    32U
+
+static uint8_t loopback_tx_buf[LOOPBACK_TX_BUF_SIZE];
+static uint8_t loopback_rx_buf[LOOPBACK_RX_BUF_SIZE];
+
+static volatile uint32_t loopback_rx_count        = 0U;
+static volatile uint32_t loopback_error_count     = 0U;
+static volatile uint8_t  loopback_rx_rearm_pending = 0U;
+
+static void loopback_rx_arm(hal_uart_handle_t *huart)
+{
+  (void)HAL_UART_ReceiveToIdle_IT(huart, loopback_rx_buf, sizeof(loopback_rx_buf));
+}
+
+static void loopback_pb15_init(void)
+{
+  HAL_RCC_GPIOB_EnableClock();
+
+  hal_gpio_config_t gpio_config;
+  gpio_config.mode        = HAL_GPIO_MODE_OUTPUT;
+  gpio_config.output_type = HAL_GPIO_OUTPUT_PUSHPULL;
+  gpio_config.pull        = HAL_GPIO_PULL_NO;
+  gpio_config.speed       = HAL_GPIO_SPEED_FREQ_LOW;
+  gpio_config.init_state  = HAL_GPIO_PIN_RESET;
+  HAL_GPIO_Init(HAL_GPIOB, HAL_GPIO_PIN_15, &gpio_config);
+}
+
+/* Same "do not re-arm from here" hazard as APP_MODE_COMMS_TEST above: the
+   actual re-arm happens in USART1_IRQHandler() below, right after
+   HAL_UART_IRQHandler() returns and rx_state is IDLE again. */
+void HAL_UART_RxCpltCallback(hal_uart_handle_t *huart, uint32_t size_byte, hal_uart_rx_event_types_t rx_event)
+{
+  (void)huart;
+  (void)size_byte;
+  (void)rx_event;
+  loopback_rx_count++;
+  HAL_GPIO_TogglePin(HAL_GPIOB, HAL_GPIO_PIN_15);
+  loopback_rx_rearm_pending = 1U;
 }
 
 void HAL_UART_ErrorCallback(hal_uart_handle_t *huart)
 {
-  comms_error_count++;
-  comms_rx_arm(huart);
+  (void)huart;
+  loopback_error_count++;
+  loopback_rx_rearm_pending = 1U;
+}
+
+void USART1_IRQHandler(void)
+{
+  hal_uart_handle_t *huart = mx_usart1_uart_gethandle();
+
+  HAL_UART_IRQHandler(huart);
+
+  if (loopback_rx_rearm_pending != 0U)
+  {
+    loopback_rx_rearm_pending = 0U;
+    loopback_rx_arm(huart);
+  }
 }
 
 #endif /* APP_MODE */
@@ -204,15 +379,34 @@ int main(void)
     HAL_Delay(LOOP_PERIOD_MS);
   }
 
-#else /* APP_MODE_COMMS_TEST */
+#elif (APP_MODE == APP_MODE_COMMS_TEST)
 
+  comms_pb15_init();
   comms_rx_arm(huart);
 
   while (1)
   {
-    /* The PING/PONG exchange runs entirely under the USART1 interrupt
-       (see HAL_UART_RxCpltCallback/ErrorCallback above); the application
-       is free to do other work here in the meantime. */
+    /* The PING/PONG exchange (including re-arming reception) runs entirely
+       under the USART1 interrupt (see USART1_IRQHandler() above); the
+       application is free to do other work here in the meantime. */
+  }
+
+#else /* APP_MODE_LOOPBACK_TEST */
+
+  loopback_pb15_init();
+  loopback_rx_arm(huart);
+
+  uint32_t ping_n = 0U;
+
+  while (1)
+  {
+    /* Re-arming reception runs under the USART1 interrupt, see
+       USART1_IRQHandler() above. */
+    int len = snprintf((char *)loopback_tx_buf, sizeof(loopback_tx_buf), "PING %lu\r\n", (unsigned long)ping_n);
+    (void)HAL_UART_Transmit_IT(huart, loopback_tx_buf, (uint32_t)len);
+    ping_n++;
+
+    HAL_Delay(LOOPBACK_TX_PERIOD_MS);
   }
 
 #endif /* APP_MODE */
