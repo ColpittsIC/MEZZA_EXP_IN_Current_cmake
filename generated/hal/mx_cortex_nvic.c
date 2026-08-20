@@ -17,6 +17,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "mx_cortex_nvic.h"
+#include "mx_spi2.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -40,6 +41,11 @@ system_status_t mx_cortex_nvic_init(void)
   HAL_CORTEX_NVIC_SetPriority(USART1_IRQn, HAL_CORTEX_NVIC_PREEMP_PRIORITY_5, HAL_CORTEX_NVIC_SUB_PRIORITY_0);
   HAL_CORTEX_NVIC_EnableIRQ(USART1_IRQn);
 
+  /* SPI2: interrupt line always enabled, harmless when unused (no interrupt
+     source enabled at the peripheral level unless a _IT transfer is armed). */
+  HAL_CORTEX_NVIC_SetPriority(SPI2_IRQn, HAL_CORTEX_NVIC_PREEMP_PRIORITY_5, HAL_CORTEX_NVIC_SUB_PRIORITY_0);
+  HAL_CORTEX_NVIC_EnableIRQ(SPI2_IRQn);
+
   return SYSTEM_OK;
 }
 
@@ -47,4 +53,13 @@ system_status_t mx_cortex_nvic_init(void)
    APP_MODE_COMMS_TEST/APP_MODE_LOOPBACK_TEST it needs to re-arm
    HAL_UART_ReceiveToIdle_IT() right after HAL_UART_IRQHandler() returns
    (once rx_state is back to IDLE), which requires access to the
-   application's RX buffer and re-arm flag. See main.c for details. */
+   application's RX buffer and re-arm flag. See main.c for details.
+
+   SPI2 does not have this hazard: SPI_CloseTransfer() (stm32c5xx_hal_spi.c)
+   resets hspi->global_state to IDLE *before* calling HAL_SPI_TxRxCpltCallback(),
+   so re-arming HAL_SPI_TransmitReceive_IT() synchronously from inside that
+   callback is safe - the handler can stay here, generic. */
+void SPI2_IRQHandler(void)
+{
+  HAL_SPI_IRQHandler(mx_spi2_gethandle());
+}

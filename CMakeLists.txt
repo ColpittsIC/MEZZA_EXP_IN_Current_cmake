@@ -17,6 +17,11 @@ include(cmake/components.cmake)
 # Stubs to be able to add compiler flag overrides, e.g. -Os
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   # Add additional source files here
+  # SPI2 is not (yet) managed by the STM32CubeMX2 codegen tooling in this
+  # project, so its mx_spi2.c/.h were added by hand under generated/hal/,
+  # following the same mx_<periph>.c/.h pattern as the other peripherals -
+  # wired in here instead of generated/hal/STM32_HAL_Driver_codegen.cmake.
+  generated/hal/mx_spi2.c
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC

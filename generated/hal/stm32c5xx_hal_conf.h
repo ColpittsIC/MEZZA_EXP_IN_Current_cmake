@@ -576,11 +576,11 @@ extern "C" {
   * @{
   */
 /* ########################## HAL_SPI Config #################################### */
-#define USE_HAL_SPI_MODULE                      0U
+#define USE_HAL_SPI_MODULE                      1U
 #define USE_HAL_SPI_CLK_ENABLE_MODEL            HAL_CLK_ENABLE_NO
 #define USE_HAL_SPI_REGISTER_CALLBACKS          0U
 #define USE_HAL_SPI_USER_DATA                   0U
-#define USE_HAL_SPI_GET_LAST_ERRORS             0U
+#define USE_HAL_SPI_GET_LAST_ERRORS             1U
 #define USE_HAL_SPI_DMA                         0U
 /* CRC FEATURE: Use to activate CRC feature inside HAL SPI Driver
  * Activated: CRC code is present inside driver
