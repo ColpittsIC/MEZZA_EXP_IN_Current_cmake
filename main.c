@@ -20,72 +20,80 @@
 #include <string.h>
 
 /* =============================================================================
- * Integrated test firmware: all three peripherals run at the same time.
- *   - ADC1  (PA0..PA7)   : 8-channel 4-20mA loop reading, polled in the main loop.
- *   - USART1(PA9/PA10)   : interrupt-driven PING/PONG link to the remote board.
- *   - SPI2  (PB12..PB15) : interrupt-driven Slave echo (byte+1) with the remote
- *                          board's SPI Master.
+ * Integrated test firmware: all three peripherals run at the same time, fully
+ * interrupt-driven, no polling/timeout anywhere in the main loop.
+ *   - USART1 (PA9/PA10)   : PING/PONG link to the remote board.
+ *   - SPI2   (PB12..PB15) : Slave side of a 4-byte command/response protocol
+ *                           the remote board (Master) uses to read this
+ *                           board's 8-channel 4-20mA ADC1 input.
+ *   - ADC1   (PA0..PA7)   : driven on demand by the SPI2 protocol below (one
+ *                           channel converted per SPI "START" command).
  * USART1 carries the real PING/PONG protocol with the remote board, so - same
- * rule as before - nothing else is ever printed on it: ADC and SPI results are
- * kept in the debugger-inspectable state below instead of being logged over
- * the wire, to avoid corrupting that protocol with extra text.
+ * rule as before - nothing else is ever printed on it: SPI2/ADC1 state is
+ * kept in the debugger-inspectable variables below instead of being logged
+ * over the wire, to avoid corrupting that protocol with extra text.
  * ===========================================================================*/
 #define UART_TX_TIMEOUT_MS      100U
 
 /* ============================== ADC1 (4-20mA) ============================== */
-#define ADC_VREF_MV             3300U  /* External VREF+ = 3.3V */
+/* PA0..PA7 -> ADC1_IN0..ADC1_IN7, CH index 0..7 maps directly to this order
+   (fixed, arbitrary choice - only mapping used by this firmware). External
+   VREF+ = 3.3V, same as the Master board's own ADC reference. */
 #define ADC_NB_CHANNELS         8U
-#define ADC_CONV_TIMEOUT_MS     10U
-#define ADC_LOOP_PERIOD_MS      500U
 
-/* 4-20mA current loop conditioning: 4mA -> 0.6V, 20mA -> 3.0V at the ADC input */
-#define LOOP_VOLTAGE_MIN_MV     600
-#define LOOP_VOLTAGE_MAX_MV     3000
-#define LOOP_CURRENT_MIN_UA     4000
-#define LOOP_CURRENT_MAX_UA     20000
-
-/* PA0..PA7 -> ADC1_IN0..ADC1_IN7 */
 static const hal_adc_channel_t adc_channels[ADC_NB_CHANNELS] =
 {
   HAL_ADC_CHANNEL_0, HAL_ADC_CHANNEL_1, HAL_ADC_CHANNEL_2, HAL_ADC_CHANNEL_3,
   HAL_ADC_CHANNEL_4, HAL_ADC_CHANNEL_5, HAL_ADC_CHANNEL_6, HAL_ADC_CHANNEL_7
 };
 
-typedef struct
+typedef enum
 {
-  int32_t raw;
-  int32_t current_ua;
-} adc_channel_result_t;
+  ADC_CH_STATE_IDLE  = 0, /* no conversion requested yet for adc_active_channel */
+  ADC_CH_STATE_BUSY  = 1, /* HAL_ADC_REG_StartConv_IT() called, EOC pending */
+  ADC_CH_STATE_READY = 2  /* adc_last_raw[adc_active_channel] holds a fresh result */
+} adc_ch_state_t;
 
-/* Latest reading per channel - inspect via debugger/live-watch. */
-static volatile adc_channel_result_t adc_results[ADC_NB_CHANNELS];
+/* Last known raw 12-bit code per channel - updated as channels get polled via
+   SPI2, readable via debugger/live-watch. */
+static volatile int32_t       adc_last_raw[ADC_NB_CHANNELS];
+static volatile uint8_t       adc_active_channel = 0U; /* channel of the most recent SPI2 START */
+static volatile adc_ch_state_t adc_conv_state     = ADC_CH_STATE_IDLE;
+static volatile uint32_t      adc_error_count     = 0U;
+static volatile uint32_t      adc_last_error_codes = 0U; /* HAL_ADC_ERROR_xxx bitmask, see stm32c5xx_hal_adc.h */
 
-static void adc_read_all_channels(hal_adc_handle_t *hadc)
+static void adc_start_channel(hal_adc_handle_t *hadc, uint8_t channel)
 {
-  for (uint32_t idx = 0U; idx < ADC_NB_CHANNELS; idx++)
-  {
-    hal_adc_channel_config_t channel_config;
-    channel_config.group          = HAL_ADC_GROUP_REGULAR;
-    channel_config.sequencer_rank = 1U;
-    channel_config.sampling_time  = HAL_ADC_SAMPLING_TIME_48CYCLES;
-    channel_config.input_mode     = HAL_ADC_IN_SINGLE_ENDED;
+  hal_adc_channel_config_t channel_config;
+  channel_config.group          = HAL_ADC_GROUP_REGULAR;
+  channel_config.sequencer_rank = 1U;
+  channel_config.sampling_time  = HAL_ADC_SAMPLING_TIME_48CYCLES;
+  channel_config.input_mode     = HAL_ADC_IN_SINGLE_ENDED;
 
-    HAL_ADC_SetConfigChannel(hadc, adc_channels[idx], &channel_config);
+  HAL_ADC_SetConfigChannel(hadc, adc_channels[channel], &channel_config);
 
-    HAL_ADC_REG_StartConv(hadc);
-    HAL_ADC_REG_PollForConv(hadc, ADC_CONV_TIMEOUT_MS);
-    int32_t raw_value = HAL_ADC_REG_ReadConversionData(hadc);
-    HAL_ADC_REG_StopConv(hadc);
+  adc_active_channel = channel;
+  adc_conv_state      = ADC_CH_STATE_BUSY;
 
-    int32_t voltage_mv = HAL_ADC_CALC_DATA_TO_VOLTAGE(ADC_VREF_MV, raw_value, HAL_ADC_RESOLUTION_12_BIT);
+  (void)HAL_ADC_REG_StartConv_IT(hadc);
+}
 
-    /* Linear scaling from conditioned voltage to loop current (integer math: nano.specs printf has no float support) */
-    int32_t current_ua = LOOP_CURRENT_MIN_UA + (voltage_mv - LOOP_VOLTAGE_MIN_MV) *
-                          (LOOP_CURRENT_MAX_UA - LOOP_CURRENT_MIN_UA) / (LOOP_VOLTAGE_MAX_MV - LOOP_VOLTAGE_MIN_MV);
+/* Fires once the single (sequencer_length == 1, see mx_adc1.c) regular
+   conversion started by adc_start_channel() completes. Safe to read the
+   result directly here: hadc->group_state[REGULAR] is reset to IDLE by the
+   driver *before* this callback runs (stm32c5xx_hal_adc.c), same safe
+   ordering as SPI2 - unlike USART1's IDLE-reception path. */
+void HAL_ADC_REG_UnitaryConvCpltCallback(hal_adc_handle_t *hadc)
+{
+  adc_last_raw[adc_active_channel] = HAL_ADC_REG_ReadConversionData(hadc);
+  adc_conv_state = ADC_CH_STATE_READY;
+}
 
-    adc_results[idx].raw        = raw_value;
-    adc_results[idx].current_ua = current_ua;
-  }
+void HAL_ADC_ErrorCallback(hal_adc_handle_t *hadc)
+{
+  adc_error_count++;
+  adc_last_error_codes = HAL_ADC_GetLastErrorCodes(hadc);
+  adc_conv_state = ADC_CH_STATE_IDLE; /* let the next SPI2 START retry cleanly */
 }
 
 /* ============================ USART1 (PING/PONG) ============================ */
@@ -203,34 +211,45 @@ void USART1_IRQHandler(void)
   }
 }
 
-/* =============================== SPI2 (echo) ================================ */
-/* SPI2 Slave echo test with the remote board (SPI Master).
+/* ======================= SPI2 (Slave: ADC read-out protocol) ================= */
+/* SPI2 Slave side of a fixed 4-byte command/response protocol with the remote
+   board (Master), which reads this board's 8 4-20mA ADC1 channels over SPI.
    Pins: PB12=NSS, PB13=SCK, PB14=MISO, PB15=MOSI - mode 0 (CPOL=0/CPHA=0),
-   8-bit, MSB first, hardware NSS. The master periodically starts a 1-byte
-   full-duplex transfer carrying an incrementing counter; this board replies
-   with (received_byte + 1) mod 256, always keeping the next transfer
-   pre-armed so it never misses a clock burst from the master.
-   NOTE on full-duplex pipelining (not a bug): the byte THIS board transmits
-   during a given transfer is the reply to the PREVIOUS transfer's received
-   byte, not to the one arriving in that same transfer - TX and RX shift on
-   the same clock edges, so a slave cannot react to and echo a byte within
-   the same transfer it arrives in. The master will see its own byte "one
-   transfer behind"; that is expected, not something to fix.
-   Same rule as USART1: no debug text is sent anywhere for this test either
-   (SPI2 doesn't share a wire with anything, but USART1 is busy with the real
-   PING/PONG protocol) - state is kept here for debugger/live-watch instead. */
-static uint8_t spi_tx_byte = 0U;
-static uint8_t spi_rx_byte = 0U;
+   8-bit, MSB first, hardware NSS (one CS pulse per 4-byte transfer).
+   Master TX: [CMD, CH, 0x00, 0x00]
+   Slave  TX: [STATUS, RAW_HI, RAW_LO, CH_ECHO]
+     CMD 0x01 START: (re)start a conversion on channel CH (0..7).
+     CMD 0x02 POLL : ask whether the result for CH is ready.
+     STATUS: 0x02 READY (RAW_HI/RAW_LO valid for channel CH_ECHO), anything
+             else (0x00 idle, 0x01 busy) means "not ready yet" to the Master.
+     RAW_HI/RAW_LO: raw 12-bit ADC code, big-endian, NOT converted to a
+             voltage/current here - the Master does that itself.
+     CH_ECHO: channel the STATUS/RAW data actually refers to, so the Master
+             can discard a response that doesn't match what it just asked
+             for (see the pipelining note below).
+   NOTE on full-duplex pipelining (not a bug, see also the byte-echo test this
+   replaced): the response transmitted during a transfer is the one prepared
+   from the PREVIOUS transfer's command, never the one arriving in the same
+   transfer - TX and RX shift on the same clock edges. The Master is expected
+   to send repeated POLL frames back-to-back (no artificial delay) until it
+   sees STATUS==READY with CH_ECHO matching what it asked for. */
+#define SPI_FRAME_SIZE          4U
+#define SPI_CMD_START           0x01U
+#define SPI_CMD_POLL            0x02U
+#define SPI_STATUS_IDLE         0x00U
+#define SPI_STATUS_BUSY         0x01U
+#define SPI_STATUS_READY        0x02U
+
+static uint8_t spi_tx_buf[SPI_FRAME_SIZE] = { SPI_STATUS_IDLE, 0U, 0U, 0U };
+static uint8_t spi_rx_buf[SPI_FRAME_SIZE];
 
 static volatile uint32_t spi_xfer_count       = 0U;
 static volatile uint32_t spi_error_count      = 0U;
 static volatile uint32_t spi_last_error_codes = 0U; /* HAL_SPI_ERROR_xxx bitmask, see stm32c5xx_hal_spi.h */
-static volatile uint8_t  spi_last_rx          = 0U;
-static volatile uint8_t  spi_last_tx          = 0U;
 
 static void spi_rearm(hal_spi_handle_t *hspi)
 {
-  (void)HAL_SPI_TransmitReceive_IT(hspi, &spi_tx_byte, &spi_rx_byte, 1U);
+  (void)HAL_SPI_TransmitReceive_IT(hspi, spi_tx_buf, spi_rx_buf, SPI_FRAME_SIZE);
 }
 
 /* Safe to re-arm directly from here, unlike the USART1 IDLE-reception path
@@ -239,12 +258,54 @@ static void spi_rearm(hal_spi_handle_t *hspi)
    defer the re-arm to the ISR/main loop. */
 void HAL_SPI_TxRxCpltCallback(hal_spi_handle_t *hspi)
 {
-  spi_last_rx = spi_rx_byte;
-  spi_tx_byte = (uint8_t)(spi_last_rx + 1U);
-  spi_last_tx = spi_tx_byte;
-  spi_xfer_count++;
+  uint8_t cmd = spi_rx_buf[0];
+  uint8_t ch  = spi_rx_buf[1] & 0x07U; /* fold any out-of-range value into the valid 0..7 set */
 
-  spi_rearm(hspi);
+  spi_xfer_count++;
+  spi_rearm(hspi); /* keep the next transfer pre-armed before touching anything else */
+
+  if (cmd == SPI_CMD_START)
+  {
+    adc_start_channel(mx_adc1_gethandle(), ch);
+    spi_tx_buf[0] = SPI_STATUS_BUSY;
+    spi_tx_buf[1] = 0U;
+    spi_tx_buf[2] = 0U;
+    spi_tx_buf[3] = ch;
+  }
+  else if (cmd == SPI_CMD_POLL)
+  {
+    if (ch != adc_active_channel)
+    {
+      /* Polling a channel that isn't the one currently tracked: report the
+         tracked channel's status instead, with its own CH_ECHO, so the
+         Master's mismatch check correctly discards this reply. */
+      spi_tx_buf[0] = (adc_conv_state == ADC_CH_STATE_READY) ? SPI_STATUS_READY : SPI_STATUS_BUSY;
+      spi_tx_buf[3] = adc_active_channel;
+    }
+    else if (adc_conv_state == ADC_CH_STATE_READY)
+    {
+      int32_t raw = adc_last_raw[adc_active_channel];
+      spi_tx_buf[0] = SPI_STATUS_READY;
+      spi_tx_buf[1] = (uint8_t)((raw >> 8) & 0xFFU);
+      spi_tx_buf[2] = (uint8_t)(raw & 0xFFU);
+      spi_tx_buf[3] = adc_active_channel;
+    }
+    else
+    {
+      spi_tx_buf[0] = (adc_conv_state == ADC_CH_STATE_BUSY) ? SPI_STATUS_BUSY : SPI_STATUS_IDLE;
+      spi_tx_buf[1] = 0U;
+      spi_tx_buf[2] = 0U;
+      spi_tx_buf[3] = ch;
+    }
+  }
+  else
+  {
+    /* Unknown command: report idle, no state change. */
+    spi_tx_buf[0] = SPI_STATUS_IDLE;
+    spi_tx_buf[1] = 0U;
+    spi_tx_buf[2] = 0U;
+    spi_tx_buf[3] = ch;
+  }
 }
 
 void HAL_SPI_ErrorCallback(hal_spi_handle_t *hspi)
@@ -292,10 +353,10 @@ int main(void)
 
   while (1)
   {
-    /* USART1 PING/PONG and SPI2 echo run entirely under their own interrupts
-       (see USART1_IRQHandler() / HAL_SPI_TxRxCpltCallback() above); the main
-       loop is only responsible for the polled ADC readings. */
-    adc_read_all_channels(hadc);
-    HAL_Delay(ADC_LOOP_PERIOD_MS);
+    /* USART1 PING/PONG, SPI2 command/response, and the ADC1 conversions SPI2
+       triggers on demand all run entirely under their own interrupts (see
+       USART1_IRQHandler() / HAL_SPI_TxRxCpltCallback() /
+       HAL_ADC_REG_UnitaryConvCpltCallback() above); the main loop has nothing
+       left to do. */
   }
 } /* end main */

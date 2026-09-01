@@ -16,6 +16,7 @@
   */
 
 /* Includes ------------------------------------------------------------------*/
+#include "mx_adc1.h"
 #include "mx_cortex_nvic.h"
 #include "mx_spi2.h"
 
@@ -46,20 +47,33 @@ system_status_t mx_cortex_nvic_init(void)
   HAL_CORTEX_NVIC_SetPriority(SPI2_IRQn, HAL_CORTEX_NVIC_PREEMP_PRIORITY_5, HAL_CORTEX_NVIC_SUB_PRIORITY_0);
   HAL_CORTEX_NVIC_EnableIRQ(SPI2_IRQn);
 
+  /* ADC1: interrupt line always enabled, harmless when unused. Used for the
+     single-channel conversions triggered on demand by SPI2 START commands
+     (HAL_ADC_REG_StartConv_IT). */
+  HAL_CORTEX_NVIC_SetPriority(ADC1_IRQn, HAL_CORTEX_NVIC_PREEMP_PRIORITY_5, HAL_CORTEX_NVIC_SUB_PRIORITY_0);
+  HAL_CORTEX_NVIC_EnableIRQ(ADC1_IRQn);
+
   return SYSTEM_OK;
 }
 
-/* NOTE: USART1_IRQHandler() is implemented in main.c, not here: in
-   APP_MODE_COMMS_TEST/APP_MODE_LOOPBACK_TEST it needs to re-arm
-   HAL_UART_ReceiveToIdle_IT() right after HAL_UART_IRQHandler() returns
-   (once rx_state is back to IDLE), which requires access to the
+/* NOTE: USART1_IRQHandler() is implemented in main.c, not here: it needs to
+   re-arm HAL_UART_ReceiveToIdle_IT() right after HAL_UART_IRQHandler()
+   returns (once rx_state is back to IDLE), which requires access to the
    application's RX buffer and re-arm flag. See main.c for details.
 
-   SPI2 does not have this hazard: SPI_CloseTransfer() (stm32c5xx_hal_spi.c)
-   resets hspi->global_state to IDLE *before* calling HAL_SPI_TxRxCpltCallback(),
-   so re-arming HAL_SPI_TransmitReceive_IT() synchronously from inside that
-   callback is safe - the handler can stay here, generic. */
+   SPI2 and ADC1 do not have this hazard: SPI_CloseTransfer()
+   (stm32c5xx_hal_spi.c) and the ADC1 regular-group unitary-conversion
+   completion path (stm32c5xx_hal_adc.c) both reset their group/global state
+   to IDLE *before* calling the respective completion callback, so re-arming
+   the next transfer/conversion synchronously from inside those callbacks (or,
+   for ADC1, from a later SPI2 START command) is safe - their handlers can
+   stay here, generic. */
 void SPI2_IRQHandler(void)
 {
   HAL_SPI_IRQHandler(mx_spi2_gethandle());
+}
+
+void ADC1_IRQHandler(void)
+{
+  HAL_ADC_IRQHandler(mx_adc1_gethandle());
 }
